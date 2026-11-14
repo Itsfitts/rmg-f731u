@@ -3,18 +3,33 @@ name: Build F731U APK
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "构建类型"
+        type: choice
+        options: [release, debug]
+        default: release
 
 permissions:
   contents: read
-  actions: write
+
+concurrency:
+  group: build-${{ github.ref }}-${{ inputs.mode || 'release' }}
+  cancel-in-progress: true
 
 jobs:
-  build-apk:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      MODE: ${{ inputs.mode || 'release' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -25,24 +40,77 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'cmdline-tools;latest build-tools;34.0.0 platforms;android-34'
-    
-      - name: Accept SDK licenses
-        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          packages: >-
+            platform-tools
+            platforms;android-37
+            build-tools;36.0.0
+            cmake;3.22.1
+            ndk;28.2.13612045
 
-      - name: Install NDK 28
+      - name: Accept SDK licenses
+        run: yes | sdkmanager --licenses > /dev/null
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Decode keystore
+        if: env.MODE == 'release'
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
         run: |
-          sdkmanager "ndk;28.2.13612045" > /dev/null 2>&1 || sdkmanager "ndk;28.1.14206865" > /dev/null 2>&1 || echo "NDK installed via fallback"
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::缺少 KEYSTORE_B64 secret"
+            exit 1
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          ls -l "$RUNNER_TEMP/release.jks"
 
       - name: Build APK
         working-directory: app-src
+        env:
+          RMG_KEYSTORE: ${{ runner.temp }}/release.jks
+          RMG_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          RMG_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          RMG_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleDebug --no-daemon
+          if [ "$MODE" = "release" ]; then
+            ./gradlew :app:assembleRelease --stacktrace
+          else
+            ./gradlew :app:assembleDebug --stacktrace
+          fi
+
+      - name: Verify signature
+        if: env.MODE == 'release'
+        run: |
+          APK=$(ls app-src/app/build/outputs/apk/release/*.apk | head -n1)
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | tail -n1)
+          "$APKSIGNER" verify --print-certs --verbose "$APK"
 
       - name: Upload APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rmg-f731u-apk
-          path: app-src/app/build/outputs/apk/debug/app-debug.apk
-          retention-days: 14
+          name: rmg-f731u-${{ env.MODE }}-${{ github.run_number }}
+          path: app-src/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rmg-f731u-release-${{ github.run_number }}
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*.apk
+          generate_release_notes: true
+          fail_on_unmatched_files: true
